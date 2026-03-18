@@ -1,66 +1,58 @@
 import pandas as pd
 import numpy as np
 
+
 def _weight_transform(values, weights):
     """
-    对分组后的 value 和 weight 进行加权变换
-    通过相同的计算方法得到归一化后的累积权重（范围 [0, 1]）
+    对每一列乘上 weight，weight 可能存在的情况：数值 or nan
+    当 weight = nan 的时候，impute weight by average of non-missing weight
+    当 value = nan 时，返回 nan
     
     Args:
-        values: 数值数组
+        values: 特征值数组
         weights: 权重数组
     
     Returns:
-        归一化后的累积权重数组（范围 [0, 1]）
+        values * weights
     """
-    sorted_indices = np.argsort(values)
-    sorted_weights = weights[sorted_indices]
+    result = np.full(len(values), np.nan)
     
-    cumsum_weights = np.cumsum(sorted_weights)
-    cumsum_weights /= cumsum_weights[-1]
+    non_nan_mask = ~pd.isna(values)
+    non_nan_values = values[non_nan_mask]
     
-    return cumsum_weights
+    if len(non_nan_values) == 0:
+        return result
+    
+    weight_nan_mask = pd.isna(weights)
+    non_nan_weights = weights[~weight_nan_mask]
+    
+    if len(non_nan_weights) > 0:
+        avg_weight = np.mean(non_nan_weights)
+    else:
+        avg_weight = 1.0
+    
+    imputed_weights = np.where(weight_nan_mask, avg_weight, weights)
+    
+    result[non_nan_mask] = non_nan_values * imputed_weights[non_nan_mask]
+    
+    return result
+
 
 def weighted_quantile(values, weights, quantile):
-    """
-    计算加权分位数
-    
-    Args:
-        values: 数值数组
-        weights: 权重数组
-        quantile: 分位数（0-1之间的值）
-    
-    Returns:
-        加权分位数值
-    """
     sorted_indices = np.argsort(values)
     sorted_values = values[sorted_indices]
     sorted_weights = weights[sorted_indices]
     
     cumsum_weights = np.cumsum(sorted_weights)
     cumsum_weights /= cumsum_weights[-1]
-    
+
     return np.interp(quantile, cumsum_weights, sorted_values)
 
-def _construct_groups(df, by, valid_mask=None):
-    """
-    构建分组
-    
-    Args:
-        df: 要处理的 DataFrame
-        by: 分组列名
-        valid_mask: 有效行的掩码
-    
-    Returns:
-        分组对象
-    """
-    if valid_mask is not None:
-        df = df[valid_mask]
-    
+
+def _construct_groups(df, by):
     if by:
         groups = df.groupby(by, dropna=False)
     else:
-        # 当 by 为 None 时，整个 DataFrame 作为一个组
         class SingleGroup:
             def __iter__(self):
                 yield (None, df)
@@ -68,10 +60,12 @@ def _construct_groups(df, by, valid_mask=None):
     
     return groups
 
+
 def rank(df, columns, by=None, weights=None, epsilon=1e-8):
     """
-    计算 columns 的排名，精度为 1e-8，na_action 强制设定为 ignore
+    计算 columns 的排名，精度为 1e-8
     排名在 [0, 1] 之间均匀分布
+    nan 进入 rank 得到 nan
     
     Args:
         df: 要处理的 DataFrame
@@ -81,320 +75,242 @@ def rank(df, columns, by=None, weights=None, epsilon=1e-8):
         epsilon: 排名精度，默认 1e-8
     
     Returns:
-        包含排名列的 DataFrame，列名为 {原列名}_rank
+        包含排名列的 DataFrame，列名为 {原列名}_r
     """
     df = df.copy()
+    original_index = df.index.copy()
+    n_rows = len(df)
     
-    # 确保 columns 是列表
     if isinstance(columns, str):
         columns = [columns]
     
-    # 确保 by 是列表
     if isinstance(by, str):
         by = [by]
     
-    # 确保 weights 是列表
     if isinstance(weights, str):
         weights = [weights]
     
-    # 强制 na_action 为 ignore
-    na_action = 'ignore'
+    groups = _construct_groups(df, by)
     
-    # 处理缺失值
-    valid_mask = pd.Series(True, index=df.index)
-    if na_action == 'ignore':
-        for col in columns:
-            valid_mask = valid_mask & ~pd.isna(df[col])
-        
-        if weights:
-            for w in weights:
-                valid_mask = valid_mask & ~pd.isna(df[w])
+    rank_results = {}
+    for col in columns:
+        rank_results[f'{col}_r'] = pd.Series(np.full(n_rows, np.nan), index=df.index)
     
-    # 构建分组
-    groups = _construct_groups(df, by, valid_mask)
-    
-    # 处理每个组
-    result_list = []
     for group_name, group_df in groups:
         if group_df.empty:
             continue
         
-        group_result = group_df.copy()
+        group_indices = group_df.index.values
         
         for col in columns:
-            if col not in group_result.columns:
+            if col not in group_df.columns:
                 continue
             
-            valid_values = group_result[col].values
+            values = group_df[col].values
             
-            # 计算排名
             if weights:
-                # 加权排名
-                weight_values = np.zeros(len(valid_values))
+                weight_values = np.zeros(len(values))
                 for w in weights:
-                    if w in group_result.columns:
-                        weight_values += group_result[w].values
+                    if w in group_df.columns:
+                        weight_values += group_df[w].values
                 
-                # 使用 _weight_transform 得到归一化后的值
-                transformed_values = _weight_transform(valid_values, weight_values)
-                
-                # 计算排名（基于归一化后的值）
-                sorted_indices = np.argsort(transformed_values, kind='stable')
-                sorted_transformed = transformed_values[sorted_indices]
-                
-                # 计算排名
-                ranks = np.zeros(len(valid_values))
-                for i in range(len(valid_values)):
-                    # 找到第一个大于等于当前值的位置
-                    rank = np.searchsorted(sorted_transformed, transformed_values[i], side='left') + 1
-                    ranks[sorted_indices[i]] = rank
-                
-                # 归一化到 [0, 1] 范围
-                if len(ranks) > 1:
-                    normalized_ranks = (ranks - 1) / (len(ranks) - 1)
-                else:
-                    normalized_ranks = np.array([0.5])  # 只有一个值时，设为 0.5
-                
-                group_result[f'{col}_rank'] = normalized_ranks
+                transformed_values = _weight_transform(values, weight_values)
             else:
-                # 普通排名
-                # 使用 stable 排序确保相同值有相同排名
-                sorted_indices = np.argsort(valid_values, kind='stable')
-                sorted_values = valid_values[sorted_indices]
+                transformed_values = values
+            
+            nan_mask = pd.isna(transformed_values)
+            valid_mask = ~nan_mask
+            valid_values = transformed_values[valid_mask]
+            
+            if len(valid_values) == 0:
+                continue
+            
+            sorted_indices = np.argsort(valid_values, kind='stable')
+            sorted_values = valid_values[sorted_indices]
+            
+            positions = np.zeros(len(valid_values))
+            
+            i = 0
+            while i < len(sorted_values):
+                j = i
+                while j < len(sorted_values) - 1 and sorted_values[j] == sorted_values[j + 1]:
+                    j += 1
                 
-                # 计算排名
-                ranks = np.zeros(len(valid_values))
-                for i in range(len(valid_values)):
-                    # 找到第一个大于等于当前值的位置
-                    rank = np.searchsorted(sorted_values, valid_values[i], side='left') + 1
-                    ranks[sorted_indices[i]] = rank
+                avg_position = (i + j) / 2.0
+                for k in range(i, j + 1):
+                    positions[sorted_indices[k]] = avg_position
                 
-                # 归一化到 [0, 1] 范围
-                if len(ranks) > 1:
-                    normalized_ranks = (ranks - 1) / (len(ranks) - 1)
-                else:
-                    normalized_ranks = np.array([0.5])  # 只有一个值时，设为 0.5
-                
-                group_result[f'{col}_rank'] = normalized_ranks
-        
-        result_list.append(group_result)
+                i = j + 1
+            
+            if len(positions) > 1:
+                normalized_ranks = positions / (len(positions) - 1)
+            else:
+                normalized_ranks = np.array([0.5])
+            
+            valid_positions = group_indices[valid_mask]
+            for idx, rank_val in zip(valid_positions, normalized_ranks):
+                rank_results[f'{col}_r'].loc[idx] = rank_val
     
-    # 合并结果
-    if result_list:
-        result = pd.concat(result_list)
-    else:
-        result = df.copy()
+    result_df = pd.DataFrame(rank_results)
+    result_df.index = original_index
     
-    # 处理无效行
-    if valid_mask is not None:
-        invalid_df = df[~valid_mask].copy()
-        result = pd.concat([result, invalid_df])
-    
-    return result
+    return result_df
+
 
 def standardize(df, columns, by=None, weights=None, na_action='ignore'):
-    """
-    计算 zscore，by 决定组别，weights 决定 mean 和 std 的权重
-    如果出现 std == 0 的情况，处理为 nan 而不是 inf
-    na_action 决定了分类方式
-    对每一行生成不同的 zscore 值
-    
-    Args:
-        df: 要处理的 DataFrame
-        columns: 要计算 zscore 的列名，可以是字符串或列表
-        by: 分组列名，在每一组内计算 zscore，如果为 None 则对所有行计算
-        weights: 权重列名，在计算 mean 和 std 时使用加权，如果为 None 则直接计算
-        na_action: 处理缺失值的方式
-    
-    Returns:
-        包含 zscore 列的 DataFrame，列名为 {原列名}_zscore
-    """
     df = df.copy()
+    original_index = df.index.copy()
     
-    # 确保 columns 是列表
     if isinstance(columns, str):
         columns = [columns]
     
-    # 确保 by 是列表
     if isinstance(by, str):
         by = [by]
     
-    # 确保 weights 是列表
     if isinstance(weights, str):
         weights = [weights]
     
-    # 处理缺失值
-    valid_mask = pd.Series(True, index=df.index)
-    if na_action == 'ignore':
-        for col in columns:
-            valid_mask = valid_mask & ~pd.isna(df[col])
-        
-        if weights:
-            for w in weights:
-                valid_mask = valid_mask & ~pd.isna(df[w])
+    groups = _construct_groups(df, by)
     
-    # 构建分组
-    groups = _construct_groups(df, by, valid_mask)
+    zscore_results = {}
+    for col in columns:
+        zscore_results[f'{col}_zscore'] = pd.Series(np.full(len(df), np.nan), index=df.index)
     
-    # 处理每个组
-    result_list = []
     for group_name, group_df in groups:
         if group_df.empty:
             continue
         
-        group_result = group_df.copy()
+        group_indices = group_df.index.values
         
         for col in columns:
-            if col not in group_result.columns:
+            if col not in group_df.columns:
                 continue
             
-            valid_values = group_result[col].values
+            values = group_df[col].values
             
-            # 计算加权 mean 和 std
             if weights:
-                # 加权 mean 和 std
-                weight_values = np.zeros(len(valid_values))
+                weight_values = np.zeros(len(values))
                 for w in weights:
-                    if w in group_result.columns:
-                        weight_values += group_result[w].values
+                    if w in group_df.columns:
+                        weight_values += group_df[w].values
                 
                 total_weight = np.sum(weight_values)
-                weighted_mean = np.sum(valid_values * weight_values) / total_weight
+                weighted_mean = np.sum(values * weight_values) / total_weight
                 
-                # 加权标准差
-                weighted_variance = np.sum(weight_values * (valid_values - weighted_mean) ** 2) / total_weight
+                weighted_variance = np.sum(weight_values * (values - weighted_mean) ** 2) / total_weight
                 weighted_std = np.sqrt(weighted_variance)
             else:
-                # 普通 mean 和 std
-                weighted_mean = np.mean(valid_values)
-                weighted_std = np.std(valid_values)
+                weighted_mean = np.mean(values)
+                weighted_std = np.std(values)
             
-            # 处理 std == 0 的情况
             if weighted_std == 0:
-                zscore = np.full(len(valid_values), np.nan)
+                zscore = np.full(len(values), np.nan)
             else:
-                zscore = (valid_values - weighted_mean) / weighted_std
+                zscore = (values - weighted_mean) / weighted_std
             
-            group_result[f'{col}_zscore'] = zscore
-        
-        result_list.append(group_result)
+            if na_action == 'ignore':
+                zscore[pd.isna(values)] = np.nan
+            elif na_action == 'concerned':
+                nan_mask = pd.isna(values)
+                if nan_mask.any():
+                    non_nan_values = values[~nan_mask]
+                    if len(non_nan_values) > 0:
+                        avg_zscore = np.mean(zscore[~nan_mask])
+                    else:
+                        avg_zscore = 0.0
+                    zscore[nan_mask] = avg_zscore
+            
+            zscore_results[f'{col}_zscore'].loc[group_indices] = zscore
     
-    # 合并结果
-    if result_list:
-        result = pd.concat(result_list)
-    else:
-        result = df.copy()
+    result_df = pd.DataFrame(zscore_results)
+    result_df.index = original_index
     
-    # 处理无效行
-    if valid_mask is not None:
-        invalid_df = df[~valid_mask].copy()
-        result = pd.concat([result, invalid_df])
-    
-    return result
+    return result_df
+
 
 def winsorize(df, columns, by=None, weights=None, lower=0.05, upper=0.95, na_action='ignore'):
-    """
-    对指定列进行 winsorize 处理（掐头去尾）
-    
-    Args:
-        df: 要处理的 DataFrame
-        columns: 要进行 winsorize 处理的列名，可以是字符串或列表
-        by: 分组列名，在每一组内进行 winsorize 处理，如果为 None 则对所有行处理
-        weights: 权重列名，在计算分位数时使用加权平均，如果为 None 则直接计算分位数
-        lower: 下分位数界，默认 0.05
-        upper: 上分位数界，默认 0.95
-        na_action: 处理缺失值的方式
-            - 'ignore': 如果任何使用到的变量（columns, by, 或 weights）为缺失值，忽略这一行
-            - 'interested': 当 columns=nan 时，fillna(0)；当 by=nan 时，单独分出一组；当 weights=nan 时，使用组内均值
-    
-    Returns:
-        处理后的 DataFrame，支持 df[target_cols] = winsorize(df, ...) 的用法
-    """
     df = df.copy()
+    original_index = df.index.copy()
     
-    # 确保 columns 是列表
     if isinstance(columns, str):
         columns = [columns]
     
-    # 确保 by 是列表
     if isinstance(by, str):
         by = [by]
     
-    # 确保 weights 是列表
     if isinstance(weights, str):
         weights = [weights]
     
-    # 处理缺失值
-    valid_mask = pd.Series(True, index=df.index)
-    if na_action == 'ignore':
-        for col in columns:
-            valid_mask = valid_mask & ~pd.isna(df[col])
-        
-        if weights:
-            for w in weights:
-                valid_mask = valid_mask & ~pd.isna(df[w])
+    groups = _construct_groups(df, by)
     
-    # 构建分组
-    groups = _construct_groups(df, by, valid_mask)
+    clipped_results = {}
+    for col in columns:
+        clipped_results[col] = df[col].copy()
     
-    # 处理每个组
-    result_list = []
     for group_name, group_df in groups:
         if group_df.empty:
             continue
         
-        group_result = group_df.copy()
+        group_indices = group_df.index.values
         
         for col in columns:
-            if col not in group_result.columns:
+            if col not in group_df.columns:
                 continue
             
-            # 保存原始数据类型
-            original_dtype = group_result[col].dtype
-                
-            valid_values = group_result[col].values
+            original_dtype = group_df[col].dtype
+            values = group_df[col].values
             
-            # 计算分位数
+            non_nan_mask = ~pd.isna(values)
+            non_nan_values = values[non_nan_mask]
+            
+            if len(non_nan_values) == 0:
+                continue
+            
             if weights:
-                # 加权分位数
-                weight_values = np.zeros(len(valid_values))
+                weight_values = np.zeros(len(values))
                 for w in weights:
-                    if w in group_result.columns:
-                        weight_values += group_result[w].values
+                    if w in group_df.columns:
+                        weight_values += group_df[w].values
                 
-                lower_bound = weighted_quantile(valid_values, weight_values, lower)
-                upper_bound = weighted_quantile(valid_values, weight_values, upper)
+                # 处理权重中的 nan 值，使用与 rank 函数相同的方法
+                weight_nan_mask = pd.isna(weight_values)
+                non_nan_weights = weight_values[~weight_nan_mask]
+                
+                if len(non_nan_weights) > 0:
+                    avg_weight = np.mean(non_nan_weights)
+                else:
+                    avg_weight = 1.0
+                
+                imputed_weights = np.where(weight_nan_mask, avg_weight, weight_values)
+                
+                lower_bound = weighted_quantile(non_nan_values, imputed_weights[non_nan_mask], lower)
+                upper_bound = weighted_quantile(non_nan_values, imputed_weights[non_nan_mask], upper)
             else:
-                # 普通分位数
-                lower_bound = np.quantile(valid_values, lower)
-                upper_bound = np.quantile(valid_values, upper)
+                lower_bound = np.quantile(non_nan_values, lower)
+                upper_bound = np.quantile(non_nan_values, upper)
             
-            # 应用 winsorize
-            clipped_values = np.clip(
-                group_result[col].values, 
-                lower_bound, 
-                upper_bound
-            )
+            clipped_values = np.clip(values, lower_bound, upper_bound)
             
-            # 转换回原始数据类型
             if pd.api.types.is_integer_dtype(original_dtype):
                 clipped_values = np.round(clipped_values).astype(original_dtype)
             elif pd.api.types.is_float_dtype(original_dtype):
                 clipped_values = clipped_values.astype(original_dtype)
             
-            group_result[col] = clipped_values
-        
-        result_list.append(group_result)
+            if na_action == 'ignore':
+                clipped_values[pd.isna(values)] = np.nan
+            elif na_action == 'concerned':
+                nan_mask = pd.isna(values)
+                if nan_mask.any():
+                    non_nan_clipped = clipped_values[~nan_mask]
+                    if len(non_nan_clipped) > 0:
+                        avg_value = np.mean(non_nan_clipped)
+                    else:
+                        avg_value = 0.0
+                    clipped_values[nan_mask] = avg_value
+            
+            clipped_results[col].loc[group_indices] = clipped_values
     
-    # 合并结果
-    if result_list:
-        result = pd.concat(result_list)
-    else:
-        result = df.copy()
+    result_df = pd.DataFrame(clipped_results)
+    result_df.index = original_index
     
-    # 处理无效行
-    if valid_mask is not None:
-        invalid_df = df[~valid_mask].copy()
-        result = pd.concat([result, invalid_df])
-    
-    return result
+    return result_df
