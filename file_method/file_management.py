@@ -106,3 +106,98 @@ def read_byclass(file_path, by, batch_size=1000):
         return pd.concat(result_list, ignore_index=True)
     else:
         return pd.DataFrame()
+
+
+def quick_read(file_path, stockid_range=None, dateid_range=None, timeid_range=None):
+    """
+    快速读取数据，利用数据的顺序特性一次性读取所有需要的数据
+    
+    数据排序规则: stockid -> dateid -> timeid
+    每个 stockid 预期行数: 360 * 240 = 86400
+    
+    Args:
+        file_path: parquet文件路径
+        stockid_range: 股票ID范围，如 range(500) 或 (0, 499)
+        dateid_range: 日期ID范围，如 range(10) 或 (0, 9)
+        timeid_range: 时间ID范围，如 range(240) 或 (0, 239)
+    
+    Returns:
+        符合条件的所有数据，类型为 pandas DataFrame
+    """
+    parquet_file = pq.ParquetFile(file_path)
+    total_rows = parquet_file.metadata.num_rows
+    num_row_groups = parquet_file.metadata.num_row_groups
+    
+    # 处理范围参数
+    if stockid_range is None:
+        stockid_min, stockid_max = 0, 499
+    elif isinstance(stockid_range, range):
+        stockid_min, stockid_max = stockid_range.start, stockid_range.stop - 1
+    elif isinstance(stockid_range, tuple) and len(stockid_range) == 2:
+        stockid_min, stockid_max = stockid_range
+    else:
+        raise ValueError("stockid_range must be range, tuple, or None")
+    
+    if dateid_range is None:
+        dateid_min, dateid_max = 0, 359
+    elif isinstance(dateid_range, range):
+        dateid_min, dateid_max = dateid_range.start, dateid_range.stop - 1
+    elif isinstance(dateid_range, tuple) and len(dateid_range) == 2:
+        dateid_min, dateid_max = dateid_range
+    else:
+        raise ValueError("dateid_range must be range, tuple, or None")
+    
+    if timeid_range is None:
+        timeid_min, timeid_max = 0, 239
+    elif isinstance(timeid_range, range):
+        timeid_min, timeid_max = timeid_range.start, timeid_range.stop - 1
+    elif isinstance(timeid_range, tuple) and len(timeid_range) == 2:
+        timeid_min, timeid_max = timeid_range
+    else:
+        raise ValueError("timeid_range must be range, tuple, or None")
+    
+    # 计算行范围
+    # 每个stockid有 360 * 240 = 86400 行
+    rows_per_stockid = 360 * 240
+    rows_per_dateid = 240
+    
+    # 计算起始行
+    start_row = stockid_min * rows_per_stockid + dateid_min * rows_per_dateid + timeid_min
+    
+    # 计算结束行
+    end_row = (stockid_max + 1) * rows_per_stockid + (dateid_max + 1) * rows_per_dateid + (timeid_max + 1)
+    end_row = min(end_row, total_rows)
+    
+    # 计算需要读取的 row groups
+    rows_per_row_group = total_rows // num_row_groups
+    start_row_group = start_row // rows_per_row_group
+    end_row_group = min(end_row // rows_per_row_group + 1, num_row_groups)
+    
+    # 读取需要的 row groups
+    result_list = []
+    for row_group_idx in range(start_row_group, end_row_group):
+        table = parquet_file.read_row_group(row_group_idx)
+        batch = table.to_pandas()
+        
+        # 对批次应用过滤条件
+        mask = pd.Series(True, index=batch.index)
+        
+        if 'stockid' in batch.columns:
+            mask &= (batch['stockid'] >= stockid_min) & (batch['stockid'] <= stockid_max)
+        
+        if 'dateid' in batch.columns:
+            mask &= (batch['dateid'] >= dateid_min) & (batch['dateid'] <= dateid_max)
+        
+        if 'timeid' in batch.columns:
+            mask &= (batch['timeid'] >= timeid_min) & (batch['timeid'] <= timeid_max)
+        
+        filtered_batch = batch[mask]
+        
+        if not filtered_batch.empty:
+            result_list.append(filtered_batch)
+    
+    # 合并所有结果
+    if result_list:
+        return pd.concat(result_list, ignore_index=True)
+    else:
+        return pd.DataFrame()
