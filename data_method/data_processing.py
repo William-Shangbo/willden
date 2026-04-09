@@ -133,6 +133,25 @@ def _construct_groups(df, by):
     return groups
 
 
+def _rank_unweighted_group(values_df):
+    ranked_df = values_df.rank(method='average', na_option='keep')
+    count_array = values_df.count().to_numpy(dtype=float)
+    count_df = pd.DataFrame(
+        np.repeat(count_array[None, :], len(values_df), axis=0),
+        index=values_df.index,
+        columns=values_df.columns,
+    )
+    normalized_df = (ranked_df - 1.0) / (count_df - 1.0)
+
+    singleton_mask = count_df.eq(1) & ranked_df.notna()
+    normalized_df = normalized_df.mask(singleton_mask, 0.5)
+
+    # Explicitly keep all-NaN groups as NaN instead of allowing unstable fill artifacts.
+    all_nan_mask = count_df.eq(0)
+    normalized_df = normalized_df.mask(all_nan_mask)
+    return normalized_df
+
+
 def rank(df, columns, by=None, weights=None, epsilon=1e-8):
     """
     计算 columns 的排名，精度为 1e-8
@@ -163,19 +182,16 @@ def rank(df, columns, by=None, weights=None, epsilon=1e-8):
 
     if not weights:
         if by:
-            ranked_df = df.groupby(by, dropna=False)[existing_columns].rank(method='average', na_option='keep')
-            count_df = df.groupby(by, dropna=False)[existing_columns].transform('count')
+            groups = _construct_groups(df, by)
+            ranked_parts = []
+            for _, group_df in groups:
+                if group_df.empty:
+                    continue
+                group_values = group_df[existing_columns]
+                ranked_parts.append(_rank_unweighted_group(group_values))
+            normalized_df = pd.concat(ranked_parts).reindex(original_index)
         else:
-            ranked_df = df[existing_columns].rank(method='average', na_option='keep')
-            count_df = pd.DataFrame(
-                np.repeat(df[existing_columns].count().to_numpy()[None, :], n_rows, axis=0),
-                index=original_index,
-                columns=existing_columns,
-            )
-
-        normalized_df = (ranked_df - 1.0) / (count_df - 1.0)
-        singleton_mask = count_df.eq(1) & ranked_df.notna()
-        normalized_df = normalized_df.mask(singleton_mask, 0.5)
+            normalized_df = _rank_unweighted_group(df[existing_columns])
         normalized_df.columns = [f'{col}_r' for col in existing_columns]
         requested_columns = [f'{col}_r' for col in columns]
         result_df = normalized_df.reindex(columns=requested_columns)
